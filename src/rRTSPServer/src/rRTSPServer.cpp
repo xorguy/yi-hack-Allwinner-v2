@@ -261,29 +261,60 @@ long long current_timestamp() {
  * "now" instead of jumping far into the future.
  *
  * Presentation times become real wall-clock (correct RTCP), and within a source
- * the uint32 subtraction still handles the camera-clock wrap. A/V sync is
- * preserved up to the (small) difference in per-stream pipeline latency.
+ * the uint32 subtraction still handles the camera-clock wrap.
+ *
+ * The anchor maps the frame to 'frame_wall', the wall-clock time at which the
+ * capture thread read it from the shared buffer, NOT to the time it is dequeued
+ * here. Frames can sit in the output queue for a variable time (up to
+ * MAX_QUEUE_SIZE frames when a source starts), and audio and video anchor at
+ * different moments, so anchoring at dequeue time gave each source a different
+ * offset (A/V skew of ~400 ms measured). With 'frame_wall' both sources map the
+ * camera clock to (almost) the same wall-clock time.
+ *
+ * Re-anchor when, for ANCHOR_DEV_FRAMES consecutive frames, the mapping is
+ * - later than 'frame_wall' by more than ANCHOR_EARLY_MS: a frame cannot be read
+ *   before it is produced, so the anchor frame itself was read late; or
+ * - earlier than 'frame_wall' by more than ANCHOR_LATE_MS: more than normal
+ *   capture lag, i.e. camera/wall clock drift or an NTP step. The audio source
+ *   lives as long as the process, so its anchor is long-lived.
  *
  * Must be called only from the (single-threaded) live555 event loop.
  */
-void frametime_to_presentation(uint32_t frame_time, struct timeval *pt,
-                               bool *have_anchor, struct timeval *anchor_wall, uint32_t *anchor_ft) {
+#define ANCHOR_EARLY_MS 20
+#define ANCHOR_LATE_MS 300
+#define ANCHOR_DEV_FRAMES 20
+
+void frametime_to_presentation(uint32_t frame_time, const struct timeval *frame_wall, struct timeval *pt,
+                               bool *have_anchor, struct timeval *anchor_wall, uint32_t *anchor_ft,
+                               int *anchor_dev_count) {
     // Re-anchor on the first frame, or if this frame precedes the anchor.
     if (*have_anchor && (int32_t)(frame_time - *anchor_ft) < 0) {
         *have_anchor = false;
     }
-    if (!*have_anchor) {
-        gettimeofday(anchor_wall, NULL);
-        *anchor_ft = frame_time;
-        *have_anchor = true;
-        *pt = *anchor_wall;
-        return;
+    if (*have_anchor) {
+        uint32_t delta_ms = frame_time - *anchor_ft;   // modular: handles the wrap
+        uint64_t usec = (uint64_t) anchor_wall->tv_usec + (uint64_t)(delta_ms % 1000) * 1000;
+        pt->tv_sec  = anchor_wall->tv_sec + (time_t)(delta_ms / 1000) + (time_t)(usec / 1000000);
+        pt->tv_usec = (long)(usec % 1000000);
+
+        // Deviation between the time the frame was read and the mapped time
+        int64_t dev_us = ((int64_t) frame_wall->tv_sec - (int64_t) pt->tv_sec) * 1000000LL
+                         + ((int64_t) frame_wall->tv_usec - (int64_t) pt->tv_usec);
+        if ((dev_us < -ANCHOR_EARLY_MS * 1000LL) || (dev_us > ANCHOR_LATE_MS * 1000LL)) {
+            (*anchor_dev_count)++;
+        } else {
+            *anchor_dev_count = 0;
+        }
+        if (*anchor_dev_count < ANCHOR_DEV_FRAMES) return;
+        fprintf(stderr, "%lld: presentation time - re-anchor, deviation %lld ms\n",
+                current_timestamp(), (long long) (dev_us / 1000));
     }
 
-    uint32_t delta_ms = frame_time - *anchor_ft;   // modular: handles the wrap
-    uint64_t usec = (uint64_t) anchor_wall->tv_usec + (uint64_t)(delta_ms % 1000) * 1000;
-    pt->tv_sec  = anchor_wall->tv_sec + (time_t)(delta_ms / 1000) + (time_t)(usec / 1000000);
-    pt->tv_usec = (long)(usec % 1000000);
+    *anchor_wall = *frame_wall;
+    *anchor_ft = frame_time;
+    *have_anchor = true;
+    *anchor_dev_count = 0;
+    *pt = *anchor_wall;
 }
 
 /* Locate a string in the circular buffer */
@@ -474,6 +505,12 @@ void *capture(void *ptr)
     unsigned char* fhs_addr[10];
     uint32_t last_counter;
 
+    // Wall clock of this pass and the newest frame time per stream type in it
+    struct timeval read_wall;
+    uint32_t newest_time_low = 0, newest_time_high = 0, newest_time_aac = 0;
+    uint32_t newest_time;
+    int32_t age_ms;
+
 #ifdef USE_SEMAPHORE
     if (sem_fshare_open() != 0) {
         fprintf(stderr, "error - could not open semaphores\n") ;
@@ -626,6 +663,16 @@ void *capture(void *ptr)
                             current_timestamp(), fhs[0].counter - (last_counter + 1));
             }
             last_counter = fhs[n - 1].counter;
+        }
+
+        // All frames of this pass are read now. The frames are in capture order,
+        // so the last one of each type is the newest: it is assumed to have been
+        // produced now, and older frames of the same type proportionally earlier.
+        gettimeofday(&read_wall, NULL);
+        for (i = 0; i < n; i++) {
+            if (fhs[i].type & 0x0800) newest_time_low = fhs[i].time;
+            else if (fhs[i].type & 0x0400) newest_time_high = fhs[i].time;
+            else if (fhs[i].type & 0x0100) newest_time_aac = fhs[i].time;
         }
 
         for (i = 0; i < n; i++) {
@@ -885,6 +932,18 @@ void *capture(void *ptr)
                         cb2s_memcpy(of.frame.data(), copy_src, frame_len);   // copy outside the lock
                         of.counter = frame_counter;
                         of.time = frame_time;
+                        // Wall clock when this frame was produced (estimated)
+                        if (frame_type == TYPE_LOW) newest_time = newest_time_low;
+                        else if (frame_type == TYPE_HIGH) newest_time = newest_time_high;
+                        else newest_time = newest_time_aac;
+                        age_ms = (int32_t) (newest_time - frame_time);
+                        if ((age_ms < 0) || (age_ms > 2000)) age_ms = 0;
+                        {
+                            int64_t wall_us = (int64_t) read_wall.tv_sec * 1000000LL + read_wall.tv_usec
+                                              - (int64_t) age_ms * 1000LL;
+                            of.wall.tv_sec = (time_t) (wall_us / 1000000LL);
+                            of.wall.tv_usec = (suseconds_t) (wall_us % 1000000LL);
+                        }
                         // Lock only for the queue push + overflow trim
                         pthread_mutex_lock(&(p_output_queue->mutex));
                         p_output_queue->frame_queue.push(std::move(of));

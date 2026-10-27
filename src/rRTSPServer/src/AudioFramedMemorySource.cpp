@@ -67,7 +67,7 @@ AudioFramedMemorySource::AudioFramedMemorySource(UsageEnvironment& env,
                                                         Boolean useTimeForPres)
     : FramedSource(env), fQBuffer(qBuffer), fProfile(1), fSamplingFrequency(samplingFrequency),
       fNumChannels(numChannels), fUseTimeForPres(useTimeForPres), fHaveStartedReading(False),
-      fHaveAnchor(false), fAnchorFt(0) {
+      fHaveAnchor(false), fAnchorFt(0), fAnchorDevCount(0) {
 
     u_int8_t samplingFrequencyIndex;
     int i;
@@ -198,7 +198,7 @@ void AudioFramedMemorySource::doGetNextFrame() {
     }
 
     if (!fUseTimeForPres) {
-        frametime_to_presentation(frame_time, &fPresentationTime, &fHaveAnchor, &fAnchorWall, &fAnchorFt);
+        frametime_to_presentation(frame_time, &f.wall, &fPresentationTime, &fHaveAnchor, &fAnchorWall, &fAnchorFt, &fAnchorDevCount);
     } else {
         // Use system clock to set presentation time
         gettimeofday(&fPresentationTime, NULL);

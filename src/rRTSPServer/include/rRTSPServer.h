@@ -181,6 +181,7 @@ typedef struct
     std::vector<unsigned char> frame;
     uint32_t time;
     int counter;
+    struct timeval wall;    // wall clock when the capture thread read the frame
 } output_frame;
 
 typedef struct
@@ -251,7 +252,8 @@ struct stream_type_s {
 };
 
 long long current_timestamp();
-void frametime_to_presentation(uint32_t frame_time, struct timeval *pt,
-                               bool *have_anchor, struct timeval *anchor_wall, uint32_t *anchor_ft);
+void frametime_to_presentation(uint32_t frame_time, const struct timeval *frame_wall, struct timeval *pt,
+                               bool *have_anchor, struct timeval *anchor_wall, uint32_t *anchor_ft,
+                               int *anchor_dev_count);
 
 #endif

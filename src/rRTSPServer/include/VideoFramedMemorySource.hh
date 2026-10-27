@@ -70,6 +70,7 @@ private:
     bool fHaveAnchor;
     struct timeval fAnchorWall;
     uint32_t fAnchorFt;
+    int fAnchorDevCount;
 };
 
 #endif
