@@ -798,13 +798,13 @@ void *capture(void *ptr)
                         // Overwrite SPS or VPS with one that contains timing info at 20 fps
                         if (fhs[i].type & 0x0002) {
                             if (frame_type == TYPE_LOW) {
-                                if (stream_type.sps_type_low & 0x0101) {
+                                if (stream_type.sps_type_low == 0x0101) {
                                     frame_len = sizeof(SPS4_640X360_TI);
                                     copy_src = SPS4_640X360_TI;
-                                } else if (stream_type.sps_type_low & 0x0201) {
+                                } else if (stream_type.sps_type_low == 0x0201) {
                                     frame_len = sizeof(SPS4_2_640X360_TI);
                                     copy_src = SPS4_2_640X360_TI;
-                                } else if (stream_type.sps_type_low & 0x0401) {
+                                } else if (stream_type.sps_type_low == 0x0401) {
                                     frame_len = sizeof(SPS4_3_640X360_TI);
                                     copy_src = SPS4_3_640X360_TI;
                                 } else {
