@@ -38,7 +38,60 @@
 
 #define HEADER_SIZE 7
 
+// Audio presentation time is derived from the AAC frame count, see audio_presentation()
+#define AUDIO_MAX_GAP_FRAMES 100    // a larger counter jump (6.4 s) is a discontinuity
+#define AUDIO_EARLY_MS 20           // re-anchor thresholds, same rule as frametime_to_presentation()
+#define AUDIO_LATE_MS 300
+#define AUDIO_DEV_FRAMES 20
+
 extern int debug;
+
+/*
+ * The camera's per-frame AAC time stamps jitter by about +-50 ms (frames 13 to
+ * 140 ms apart, measured), although every frame holds exactly 1024 samples.
+ * Use the frame count instead: pt = anchor + frames * fuSecsPerFrame. Frames
+ * lost upstream still advance the time line (the stream counter jumps), so audio
+ * stays in step with the wall clock. The anchor is the wall-clock time at which
+ * the capture thread read the frame; it is re-anchored on a discontinuity, or
+ * if the time line drifts from the read time (same rule as for video).
+ */
+static void audio_presentation(u_int16_t counter, const struct timeval *frame_wall, unsigned uSecsPerFrame,
+                               struct timeval *pt, bool *have_anchor, struct timeval *anchor_wall,
+                               u_int64_t *frames, u_int16_t *last_counter, int *dev_count) {
+    if (*have_anchor) {
+        u_int16_t step = (u_int16_t) (counter - *last_counter);    // modular: handles the 16-bit wrap
+        if ((step == 0) || (step > AUDIO_MAX_GAP_FRAMES)) {
+            *have_anchor = false;
+        } else {
+            *frames += step;
+        }
+    }
+    *last_counter = counter;
+
+    if (*have_anchor) {
+        int64_t t_us = (int64_t) anchor_wall->tv_sec * 1000000LL + anchor_wall->tv_usec
+                       + (int64_t) (*frames) * uSecsPerFrame;
+        int64_t dev_us = ((int64_t) frame_wall->tv_sec * 1000000LL + frame_wall->tv_usec) - t_us;
+        if ((dev_us < -AUDIO_EARLY_MS * 1000LL) || (dev_us > AUDIO_LATE_MS * 1000LL)) {
+            (*dev_count)++;
+        } else {
+            *dev_count = 0;
+        }
+        if (*dev_count < AUDIO_DEV_FRAMES) {
+            pt->tv_sec = (time_t) (t_us / 1000000LL);
+            pt->tv_usec = (suseconds_t) (t_us % 1000000LL);
+            return;
+        }
+        fprintf(stderr, "%lld: AudioFramedMemorySource - re-anchor, deviation %lld ms\n",
+                current_timestamp(), (long long) (dev_us / 1000));
+    }
+
+    *anchor_wall = *frame_wall;
+    *frames = 0;
+    *have_anchor = true;
+    *dev_count = 0;
+    *pt = *anchor_wall;
+}
 
 ////////// FramedMemorySource //////////
 
@@ -67,7 +120,7 @@ AudioFramedMemorySource::AudioFramedMemorySource(UsageEnvironment& env,
                                                         Boolean useTimeForPres)
     : FramedSource(env), fQBuffer(qBuffer), fProfile(1), fSamplingFrequency(samplingFrequency),
       fNumChannels(numChannels), fUseTimeForPres(useTimeForPres), fHaveStartedReading(False),
-      fHaveAnchor(false), fAnchorFt(0), fAnchorDevCount(0) {
+      fHaveAnchor(false), fAnchorFt(0), fAnchorDevCount(0), fAudioFrames(0), fLastAudioCounter(0) {
 
     u_int8_t samplingFrequencyIndex;
     int i;
@@ -198,7 +251,8 @@ void AudioFramedMemorySource::doGetNextFrame() {
     }
 
     if (!fUseTimeForPres) {
-        frametime_to_presentation(frame_time, &f.wall, &fPresentationTime, &fHaveAnchor, &fAnchorWall, &fAnchorFt, &fAnchorDevCount);
+        audio_presentation((u_int16_t) f.counter, &f.wall, fuSecsPerFrame, &fPresentationTime,
+                           &fHaveAnchor, &fAnchorWall, &fAudioFrames, &fLastAudioCounter, &fAnchorDevCount);
     } else {
         // Use system clock to set presentation time
         gettimeofday(&fPresentationTime, NULL);

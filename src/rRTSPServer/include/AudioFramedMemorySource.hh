@@ -71,6 +71,8 @@ private:
     struct timeval fAnchorWall;
     uint32_t fAnchorFt;
     int fAnchorDevCount;
+    u_int64_t fAudioFrames;         // AAC frames since the anchor
+    u_int16_t fLastAudioCounter;    // stream counter of the previous AAC frame
 };
 
 #endif
