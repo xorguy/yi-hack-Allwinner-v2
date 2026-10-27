@@ -29,6 +29,10 @@
 #include <vector>
 #include <utility>
 
+// Poll interval when the queue is empty: 5 ms is 1/10 of a frame interval at
+// 20 fps (the capture thread itself polls the shared buffer every 10 ms).
+#define POLL_USEC_VIDEO 5000
+
 unsigned char NALU_HEADER[] = { 0x00, 0x00, 0x00, 0x01 };
 
 extern int debug;
@@ -135,11 +139,10 @@ void VideoFramedMemorySource::doGetNextFrame() {
         if (fQBuffer->frame_queue.size() == 0) {
             pthread_mutex_unlock(&(fQBuffer->mutex));
             if (debug & 4) fprintf(stderr, "%lld: VideoFramedMemorySource - doGetNextFrame() queue is empty\n", current_timestamp());
-            fFrameSize = 0;
-            fNumTruncatedBytes = 0;
-            //usleep(2000);
-            nextTask() = envir().taskScheduler().scheduleDelayedTask(2000,
-                                 (TaskFunc*)FramedSource::afterGetting, this);
+            // No frame available: poll again later. Do NOT deliver an empty frame
+            // (it would run through the framer/fragmenter chain every 2 ms).
+            nextTask() = envir().taskScheduler().scheduleDelayedTask(POLL_USEC_VIDEO,
+                                 doGetNextFrameTask, this);
             return;
         } else if (fQBuffer->frame_queue.front().frame.size() < 5) {
             // Too small, drop it
@@ -196,10 +199,13 @@ void VideoFramedMemorySource::doGetNextFrame() {
         fLastCounter = frame_counter;
         fHaveLastCounter = True;
     } else {
-        // The frame is larger than the available buffer: drop it
-        fFrameSize = 0;
-        fNumTruncatedBytes = 0;
+        // The frame is larger than the available buffer: drop it and fetch the
+        // next one (never deliver an empty frame). fLastCounter is not updated,
+        // so the next frame is a discontinuity and resyncs on a sync frame.
         fprintf(stderr, "%lld: VideoFramedMemorySource - doGetNextFrame() error - frame larger than buffer %d/%d - frame lost\n", current_timestamp(), size, fMaxSize);
+        nextTask() = envir().taskScheduler().scheduleDelayedTask(0,
+                             doGetNextFrameTask, this);
+        return;
     }
 
     if (!fUseTimeForPres) {

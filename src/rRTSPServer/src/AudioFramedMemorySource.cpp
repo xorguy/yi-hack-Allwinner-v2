@@ -32,6 +32,10 @@
 #define MILLIS_25 25000
 #define MILLIS_10 10000
 
+// Poll interval when the queue is empty. An AAC frame (1024 samples @ 16 kHz)
+// lasts 64 ms, so 10 ms adds negligible latency.
+#define POLL_USEC_AUDIO 10000
+
 #define HEADER_SIZE 7
 
 extern int debug;
@@ -147,11 +151,11 @@ void AudioFramedMemorySource::doGetNextFrame() {
         if (fQBuffer->frame_queue.size() == 0) {
             pthread_mutex_unlock(&(fQBuffer->mutex));
             if (debug & 8) fprintf(stderr, "%lld: AudioFramedMemorySource - doGetNextFrame() read_index = write_index\n", current_timestamp());
-            fFrameSize = 0;
-            fNumTruncatedBytes = 0;
-            //usleep(2000);
-            nextTask() = envir().taskScheduler().scheduleDelayedTask(2000,
-                                 (TaskFunc*)FramedSource::afterGetting, this);
+            // No frame available: poll again later. Do NOT deliver an empty frame:
+            // MPEG4GenericRTPSink would send it as an empty RTP packet with a stale
+            // presentation time (~330 packets/s per session).
+            nextTask() = envir().taskScheduler().scheduleDelayedTask(POLL_USEC_AUDIO,
+                                 doGetNextFrameTask, this);
             return;
         } else if (fQBuffer->frame_queue.front().frame.size() < (unsigned)(HEADER_SIZE + 1)) {
             // Too small, drop it
@@ -185,10 +189,12 @@ void AudioFramedMemorySource::doGetNextFrame() {
         std::memcpy(fTo, ptr, size);
         fNumTruncatedBytes = 0;
     } else {
-        // The frame is larger than the available buffer: drop it
-        fFrameSize = 0;
-        fNumTruncatedBytes = 0;
+        // The frame is larger than the available buffer: drop it and fetch the
+        // next one (never deliver an empty frame)
         fprintf(stderr, "%lld: AudioFramedMemorySource - doGetNextFrame() error - frame larger than buffer %d/%d - frame lost\n", current_timestamp(), size, fMaxSize);
+        nextTask() = envir().taskScheduler().scheduleDelayedTask(0,
+                             doGetNextFrameTask, this);
+        return;
     }
 
     if (!fUseTimeForPres) {
